@@ -1,0 +1,13 @@
+#!/bin/bash
+python csi_logger.py --port COM9 --label passing-by --duration 8 --start-delay 5 \
+  --cmd "wlan-remove test" \
+  --cmd "wlan-add test ssid PRESENSE_TEST_2 wpa2 psk 1234567890" \
+  --cmd "wlan-connect test" \
+  --cmd "wlan-set-csi-param-header sta 1 66051 66051 170 1 149 0 0" \
+  --cmd "wlan-set-csi-filter add c2:95:da:01:6e:c9 255 08 0" \
+  --cmd "wlan-csi-cfg" \
+  --src-mac "c2:95:da:01:6e:c9" \
+  --stop-cmd "wlan-set-csi-param-header sta 2 66051 66051 170 1 149 0 0" \
+  --stop-cmd "wlan-csi-cfg" \
+  --quiet \
+  --out data
