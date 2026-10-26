@@ -14,6 +14,14 @@ Usage:
         --scale-shift 4 --empty-label empty \
         --window-sec 3 --overlap 0.5
 
+Recommended for the 5-class motion model (see TRAINING_IMPROVEMENTS.md):
+    python csi_clean.py --data-dir data --out-dir clean --empty-label empty \
+        --window-sec 6 --overlap 0.75 --hampel-window 1 --min-fill 0.7
+
+--min-fill: windows with fewer than this fraction of the expected records are
+dropped rather than padded (padding repeats the last record and looks like
+'no motion', which blurs approaching/leaving vs idle).
+
 --scale-shift: the fixed-point exponent from AN14281's CSI format table for
 the header/format you used in wlan-set-csi-param-header. Confirm this value
 against the note before trusting absolute amplitude scale; it does not affect
@@ -153,23 +161,27 @@ def hampel_filter(matrix, window=7, n_sigmas=3.0):
 
 # ---------- Phase 8: windowing ------------------------------------------------
 
-def make_windows(amp_matrix, tsf, is_stall, window_sec, overlap, min_fill=0.7):
-    tsf_sec = (tsf.astype(np.float64) - tsf[0]) / 1e6  # assumes TSF in microseconds; see note below
+def make_windows(amp_matrix, tsf, is_stall, window_sec, overlap, target_len, min_fill=0.7):
+    """Slice into time windows. Windows that contain a stall, or hold fewer than
+    min_fill * target_len records, are dropped instead of being padded later -
+    heavy padding repeats the last record and fakes a 'motionless' tail."""
+    tsf_sec = (tsf.astype(np.float64) - tsf[0]) / 1e6  # assumes TSF in microseconds
     windows, starts = [], []
     t = 0.0
     step = window_sec * (1 - overlap)
     total = tsf_sec[-1] if len(tsf_sec) else 0.0
-    expected_n = None
+    min_records = max(1, int(np.ceil(min_fill * target_len)))
+    n_underfilled = 0
     while t + window_sec <= total + 1e-9:
-        mask = (tsf_sec >= t) & (tsf_sec < t + window_sec)
-        idx = np.where(mask)[0]
-        if expected_n is None and t == 0.0:
-            expected_n = None  # will be set from the first full window below
+        idx = np.where((tsf_sec >= t) & (tsf_sec < t + window_sec))[0]
         if len(idx) > 0 and not is_stall[idx].any():
-            windows.append(amp_matrix[idx])
-            starts.append(t)
+            if len(idx) >= min_records:
+                windows.append(amp_matrix[idx])
+                starts.append(t)
+            else:
+                n_underfilled += 1
         t += step
-    return windows, starts
+    return windows, starts, n_underfilled
 
 
 def pad_or_trim(windows, target_len):
@@ -185,7 +197,7 @@ def pad_or_trim(windows, target_len):
 
 # ---------- Main per-session pipeline ----------------------------------------
 
-def process_session(csv_path, meta, args, null_mask_holder):
+def process_session(csv_path, meta, args, null_mask_holder, target_len):
     df = pd.read_csv(csv_path)
     n_raw = len(df)
 
@@ -210,8 +222,8 @@ def process_session(csv_path, meta, args, null_mask_holder):
     is_stall = find_stalls(tsf, args.stall_factor)
     amp, n_outliers = hampel_filter(amp, window=args.hampel_window, n_sigmas=args.hampel_sigmas)
 
-    windows, starts = make_windows(amp, tsf, is_stall, args.window_sec, args.overlap)
-    target_len = int(round(args.window_sec * meta.get("rate_hz", 10)))
+    windows, starts, n_underfilled = make_windows(amp, tsf, is_stall, args.window_sec, args.overlap,
+                                                  target_len, args.min_fill)
     windows_arr = pad_or_trim(windows, max(target_len, 1))
 
     labels = np.array([meta["label"]] * len(windows_arr))
@@ -224,7 +236,8 @@ def process_session(csv_path, meta, args, null_mask_holder):
     stats = {
         "session": csv_path.stem, "label": meta["label"], "raw": n_raw, "bad": n_bad,
         "inconsistent": n_inconsistent, "kept_records": len(df), "outlier_points": n_outliers,
-        "stall_count": int(is_stall.sum()), "n_windows": len(windows_arr),
+        "stall_count": int(is_stall.sum()), "underfilled_windows": n_underfilled,
+        "n_windows": len(windows_arr),
         "n_subcarriers": amp.shape[1],
     }
     return out_path, stats
@@ -244,6 +257,21 @@ def main():
     ap.add_argument("--src-mac", default=None, help="keep only records from this AP MAC")
     ap.add_argument("--window-sec", type=float, default=3.0)
     ap.add_argument("--overlap", type=float, default=0.5)
+    ap.add_argument("--rate-hz", type=float, default=10.0,
+                    help="nominal records/sec used to fix every session's window length "
+                         "(records per window = round(window_sec * rate_hz)), so all sessions "
+                         "produce IDENTICAL window shapes and can be concatenated into "
+                         "all_sessions.npz. Using each session's own measured rate (as earlier "
+                         "versions of this script did) causes a shape mismatch across sessions "
+                         "whose actual capture rate differed slightly. 10 matches the beacon-rate "
+                         "capture used throughout this project; check your sessions' .json "
+                         "'rate_hz' values and adjust if yours differ notably from 10.")
+    ap.add_argument("--min-fill", type=float, default=0.7,
+                    help="drop windows holding fewer than this fraction of the fixed "
+                         "records/window (instead of padding them with repeated records)")
+    ap.add_argument("--min-sessions", type=int, default=8,
+                    help="warn when a label has fewer sessions than this; leave-one-session-out "
+                         "evaluation and csi_split.py need several sessions per label")
     ap.add_argument("--stall-factor", type=float, default=3.0)
     ap.add_argument("--hampel-window", type=int, default=7)
     ap.add_argument("--hampel-sigmas", type=float, default=3.0)
@@ -268,6 +296,10 @@ def main():
         return (0 if meta.get("label") == args.empty_label else 1, -meta.get("records", 0))
     csv_paths.sort(key=sort_key)
 
+    target_len = max(1, int(round(args.window_sec * args.rate_hz)))
+    print(f"fixed window length: {target_len} records/window "
+         f"(window_sec={args.window_sec} x rate_hz={args.rate_hz}) - applied to ALL sessions")
+
     null_mask_holder = {"mask": None}
     all_windows, all_labels, all_sessions = [], [], []
     report = []
@@ -278,7 +310,12 @@ def main():
             print(f"skip {csv_path.name}: no matching .json", file=sys.stderr)
             continue
         meta = json.loads(meta_path.read_text())
-        out_path, stats = process_session(csv_path, meta, args, null_mask_holder)
+        actual_rate = meta.get("rate_hz")
+        if actual_rate and abs(actual_rate - args.rate_hz) / args.rate_hz > 0.25:
+            print(f"  NOTE {csv_path.stem}: measured rate_hz={actual_rate} differs from "
+                 f"--rate-hz={args.rate_hz} by >25% - its windows will be padded/trimmed more "
+                 f"than usual to fit the fixed {target_len}-record shape", file=sys.stderr)
+        out_path, stats = process_session(csv_path, meta, args, null_mask_holder, target_len)
         report.append(stats)
         print(f"{csv_path.stem}: {stats}")
         if out_path is not None:
@@ -299,6 +336,19 @@ def main():
                             session_id=np.concatenate(all_sessions))
 
     (args.out_dir / "report.json").write_text(json.dumps(report, indent=2))
+
+    per_label = {}
+    for s in report:
+        if s.get("n_windows", 0) and "label" in s:
+            c = per_label.setdefault(s["label"], {"sessions": 0, "windows": 0})
+            c["sessions"] += 1
+            c["windows"] += s["n_windows"]
+    print("\nper label (sessions with >=1 window):")
+    for lbl, c in sorted(per_label.items()):
+        flag = "" if c["sessions"] >= args.min_sessions else \
+            f"  <- fewer than {args.min_sessions} sessions, record more"
+        print(f"  {lbl:<14} {c['sessions']:3d} sessions {c['windows']:5d} windows{flag}")
+
     total_windows = sum(s.get("n_windows", 0) for s in report)
     print(f"\nDone. {total_windows} windows across {len(report)} sessions -> {args.out_dir}/")
 

@@ -1,5 +1,7 @@
 #!/bin/bash
-python csi_logger.py --port COM9 --label leaving --duration 8 --start-delay 5 \
+
+PORT=$1
+python csi_logger.py --port $PORT --label leaving --duration 8 --start-delay 5 \
   --cmd "wlan-remove test" \
   --cmd "wlan-add test ssid PRESENSE_TEST_2 wpa2 psk 1234567890" \
   --cmd "wlan-connect test" \

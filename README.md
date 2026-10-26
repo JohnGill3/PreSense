@@ -160,6 +160,10 @@ Hampel outlier filter, and slices into overlapping windows.
 train a model you intend to deploy — otherwise training and on-device
 preprocessing diverge.
 
+Windows holding fewer than `--min-fill` (default 0.7) of the expected
+records are dropped instead of padded, and a per-label session summary warns
+about labels with fewer than `--min-sessions` (default 8) sessions.
+
 Outputs: `clean/<session>.npz` per session, `clean/all_sessions.npz`
 combined, `clean/null_subcarrier_mask.npy`, and `clean/report.json` with
 per-phase drop counts — check this after every run.
@@ -199,6 +203,13 @@ accuracy gap (warns above 0.15 — likely overfitting or too few sessions), and
 feature importance. Writes `results/train_report.json`. Use `--save-model` to
 also write `results/model.joblib` for later export without retraining; use
 this stage to iterate on `--trees`/`--depth` before committing to export.
+
+For the 5-class motion model, `--two-stage` (static-vs-moving gate plus two
+specialists), `--cv` (leave-one-session-out), `--grid` and `--vote` give the
+best and most trustworthy accuracy; the default feature set is now `dynamic`
+(`--features meanvar` reproduces the firmware-compatible features). See
+[TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md) for measured results,
+the recommended commands, and what the firmware needs before deploying them.
 
 ## 5b. Train, evaluate and export for firmware — `csi_train_export.py`
 
