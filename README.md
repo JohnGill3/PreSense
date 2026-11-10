@@ -3,8 +3,8 @@
 Wi-Fi CSI presence/motion sensing on the NXP FRDM-RW612. The board captures
 raw Channel State Information (CSI) from Wi-Fi frames, a Python pipeline turns
 recorded sessions into a trained classifier, and the classifier runs on the
-RW612's Cortex-M33 (via [emlearn](https://github.com/emlearn/emlearn)),
-reporting results over the console and/or a UART pin as NDJSON.
+RW612's Cortex-M33 as exported C forest tables, driving an ON/OFF
+`control` JSON stream on a dedicated UART (diagnostic NDJSON stays on the console).
 
 This README has not been validated end to end on hardware. Known gaps are
 flagged inline — check them before trusting a step blindly.
@@ -13,27 +13,30 @@ flagged inline — check them before trusting a step blindly.
 
 ```
 PreSense/
-├── application/         # Firmware: NXP's dm-motion-detection-using-wifi-csi-on-rw61x
-│                         # demo, revised with the CSI logger and presence classifier
-│   └── source/
-│       ├── csi_raw_log.c/.h       # Driver callback -> queue -> logger task
-│       ├── csi_presence.c/.h      # Preprocessing, featurize, emlearn inference
-│       ├── csi_uart_out.c/.h      # NDJSON formatting + UART/console dispatch
-│       ├── csi_model.h            # Generated: emlearn forest (not committed, see below)
-│       ├── csi_model_config.h     # Generated: window/subcarrier/class constants
-│       └── csi_selftest.h         # Generated: known-good vectors for on-device self-test
-├── sdk/                  # MCUXpresso SDK v25.09.00 for FRDM-RW612
-├── scripts/               # Python pipeline (this repo's own code)
+├── csi_raw_log.c/.h        # Firmware: driver callback -> record pool -> worker task
+├── csi_presence.c/.h       # Firmware: preprocessing, features, exported forest inference
+├── csi_control.c/.h        # Firmware: ON/OFF policy, control JSON formatter, CRC-16
+├── csi_uart_out.c/.h       # Firmware: output task (control UART + debug console NDJSON)
+├── data-collection-scripts/
 │   ├── csi_logger.py       # Step 2: record one labelled session from the board
-│   ├── csi_clean.py        # Step 3: validate, decode, window raw sessions
+│   └── data/               # Recorded sessions: <label>_<date>_<time>.csv + .json (gitignored)
+├── model-training-scripts/
+│   ├── csi_clean.py        # Step 3: validate, decode, window (time or records mode)
 │   ├── csi_split.py        # Step 4: split windows into train/val/test BY SESSION
-│   ├── csi_train_eval.py   # Step 5a: train + evaluate only, with logging
-│   └── csi_train_export.py # Step 5b: train + evaluate + export C headers
-├── data/                  # Recorded sessions (csi_logger.py output) — gitignore raw data
-├── clean/                 # csi_clean.py / csi_split.py output — gitignore
-├── firmware_export/       # csi_train_export.py output — copy into application/source/
+│   ├── csi_train_eval.py   # Step 5a: train + evaluate (+ --save-model)
+│   ├── csi_train_export.py # Step 5b: export a saved model to C headers, with parity checks
+│   ├── csi_replay_parity.py# Raw CSV -> real csi_presence.c replay check (host gcc)
+│   └── host_stubs/         # Minimal FreeRTOS/SDK headers for host compilation
+├── schemas/presense-control.v1.schema.json  # UART control message schema
+├── receiver/presense_control_rx.py          # Reference receiver / parser specification
+├── tests/                  # pytest: control policy, UART task, receiver, records mode
+├── artifacts/              # Pipeline outputs (clean/, results/, firmware_export/) — gitignored
 └── README.md
 ```
+
+The firmware sources are fragments for the NXP
+dm-motion-detection-using-wifi-csi-on-rw61x demo (SDK 25.12, MCUXpresso IDE);
+the demo project and SDK themselves are not in this repository.
 
 **Suggested `.gitignore` entries:** `data/`, `clean/`, `firmware_export/`,
 `results/` — these are regenerated, not hand-authored, and recorded CSI
@@ -79,7 +82,7 @@ runnable out of the box.
   components installed.
 - **Python:** 3.9+ recommended.
   ```bash
-  pip install pyserial numpy pandas scipy scikit-learn emlearn joblib
+  pip install pyserial numpy pandas scipy scikit-learn joblib jsonschema pytest
   ```
 
 ## 1. Build and flash the data-collection firmware
@@ -113,7 +116,7 @@ and `wlan_tests.c` before relying on either.
 ## 2. Record labelled sessions — `csi_logger.py`
 
 ```bash
-python scripts/csi_logger.py \
+python data-collection-scripts/csi_logger.py \
   --port COM5 --label empty --duration 180 --start-delay 15 \
   --cmd "wlan-add test ssid <SSID> wpa2 psk <PASSWORD>" \
   --cmd "wlan-connect test" \
@@ -137,10 +140,18 @@ Key flags: `--port`, `--baud` (default 115200, must match the board),
 `--label`, `--duration`, `--start-delay` (time to leave the room),
 `--src-mac` (keep only this AP's records). Run `--help` for the rest.
 
+For higher-rate capture, `data-collection-scripts/csi_logger.py` supports
+optional Linux `--ping-target <RW612_IP> --ping-rate 100` traffic and
+`--target-csi-rate 100` diagnostics. See
+[HIGH_RATE_CAPTURE.md](data-collection-scripts/HIGH_RATE_CAPTURE.md) for
+data-frame filtering, serial bandwidth limits, manual iperf options, and
+training-rate compatibility. Generating 100 packets/s does not guarantee
+100 CSI records/s; 115200-baud hex logging cannot sustain that target.
+
 ## 3. Clean and window — `csi_clean.py`
 
 ```bash
-python scripts/csi_clean.py \
+python model-training-scripts/csi_clean.py \
   --data-dir data --out-dir clean \
   --empty-label empty --src-mac <AP_MAC> \
   --window-sec 3 --overlap 0.5 \
@@ -175,7 +186,7 @@ project assumed; per-record normalization absorbs a constant scale anyway).
 ## 4. Split by session — `csi_split.py`
 
 ```bash
-python scripts/csi_split.py \
+python model-training-scripts/csi_split.py \
   --input clean/all_sessions.npz --out-dir clean \
   --val-frac 0.15 --test-frac 0.15 --seed 42
 ```
@@ -191,7 +202,7 @@ all three splits — record more sessions for that class if so.
 ## 5a. Train and evaluate only — `csi_train_eval.py`
 
 ```bash
-python scripts/csi_train_eval.py --clean-dir clean --out-dir results
+python model-training-scripts/csi_train_eval.py --clean-dir clean --out-dir results
 ```
 
 Trains a `RandomForestClassifier` on `[mean | variance]` per-subcarrier
@@ -211,94 +222,319 @@ best and most trustworthy accuracy; the default feature set is now `dynamic`
 [TRAINING_IMPROVEMENTS.md](TRAINING_IMPROVEMENTS.md) for measured results,
 the recommended commands, and what the firmware needs before deploying them.
 
-## 5b. Train, evaluate and export for firmware — `csi_train_export.py`
+## 5b. Deployment pipeline: records-mode clean → train → exact export
+
+The firmware classifies a sliding window of `CSI_WIN_LEN` accepted records
+every `CSI_HOP` records. A deployable model must therefore be trained on
+**records-mode** windows built with the firmware's own rules. Time-window
+mode (sections 3–5a) is still available for experiments, but it cannot be
+exported. All scripts are in `model-training-scripts/`. Use a separate virtual
+environment:
 
 ```bash
-python scripts/csi_train_export.py \
-  --clean-dir clean --out-dir firmware_export \
-  --window-sec 3 --overlap 0.5 \
-  --ap-mac <AP_MAC> --empty-label empty
+python3 -m venv .venv-deploy
+.venv-deploy/bin/pip install -r requirements.txt   # numpy pandas scikit-learn joblib jsonschema pyserial pytest
 ```
 
-**`--window-sec` and `--overlap` must match the values given to
-`csi_clean.py`.** The script does not read them back from `clean/`; a mismatch
-produces firmware constants that silently disagree with the trained model.
+**Baseline:** mean/variance features, 30-record windows (about 3.1 s at the
+measured ~9.76 records/s), hop 15.
 
-Same training/evaluation as `csi_train_eval.py`, plus:
-- Converts the forest to C via `emlearn.convert(..., method='inline')`.
-- Checks Python-vs-generated-C agreement on the test set where the installed
-  emlearn version supports it.
-- Emits the window length, hop, kept-subcarrier list, I/Q scale, stall
-  threshold, class names and the "empty" class index as `#define`s / arrays —
-  values the firmware needs but has no other way to know.
-- Picks one test window per class and exports it (raw window, expected
-  features, expected class) for an on-device self-test.
+```bash
+P=.venv-deploy/bin/python; S=model-training-scripts; B=artifacts/presense/baseline
+$P $S/csi_clean.py --data-dir data-collection-scripts/data --out-dir $B/clean \
+  --window-mode records --win-len 30 --hop 15 --hampel-window 1 \
+  --empty-label empty --val-frac 0.15 --test-frac 0.15 --seed 42
+$P $S/csi_split.py --input $B/clean/all_sessions.npz --out-dir $B/clean \
+  --assignment $B/clean/split_manifest.json
+$P $S/csi_train_eval.py --clean-dir $B/clean --out-dir $B/results \
+  --features meanvar --model rf --trees 10 --depth 10 --seed 42 --vote 1 --save-model
+$P $S/csi_train_export.py --model $B/results/model.joblib \
+  --clean-dir $B/clean --out-dir $B/firmware_export
+```
+
+**Improved:** `[mean | variance | slope | mean absolute adjacent difference]`
+features, 60-record windows (about 6.1 s), hop 15. It uses the **same session
+split** as the baseline. The model settings were chosen on validation only.
+
+```bash
+I=artifacts/presense/improved
+$P $S/csi_clean.py --data-dir data-collection-scripts/data --out-dir $I/clean \
+  --window-mode records --win-len 60 --hop 15 --hampel-window 1 \
+  --empty-label empty --split-manifest $B/clean/split_manifest.json
+$P $S/csi_split.py --input $I/clean/all_sessions.npz --out-dir $I/clean \
+  --assignment $I/clean/split_manifest.json
+$P $S/csi_train_eval.py --clean-dir $I/clean --out-dir $I/results \
+  --features full --model rf --trees 30 --depth 8 --seed 42 --vote 1 --save-model
+$P $S/csi_train_export.py --model $I/results/model.joblib \
+  --clean-dir $I/clean --out-dir $I/firmware_export
+```
+
+What records mode guarantees (`csi_clean.py --window-mode records`):
+
+- **Same record rules as the firmware:**
+  - Records are validated, then filtered by AP MAC, channel (header byte 37)
+    and payload size.
+  - Amplitudes are normalized per record.
+  - A TSF gap larger than `stall_us`, or a TSF reset, restarts the window.
+  - The first window is full; after that, one window every `hop` records.
+  - There is no padding.
+- **The split is fixed before fitting:**
+  - Sessions are assigned to train/val/test first.
+  - The null-subcarrier mask is fitted only on the longest **training**
+    `empty` session.
+  - `preprocess_config.json` records everything the exporter needs (mask,
+    filters, `stall_us`, window layout, raw-file hashes, split).
+  - The exporter refuses missing or conflicting metadata instead of guessing.
+
+`csi_train_export.py` exports the **saved** model; it never retrains. It
+supports `meanvar`, `dynamic` and `full` features, and single or two-stage
+forests. Its own table-driven C forest makes the same decisions as sklearn
+(thresholds are rounded down to float32), so emlearn is no longer needed.
+
+The export is marked `deployable` only if all of these blocking checks pass:
+
+1. The generated C forest, compiled on the host, agrees with Python on every
+   val and test vector (class and confidence).
+2. **Raw replay** (`csi_replay_parity.py`): the raw CSV records of each test
+   session are streamed through the real `csi_presence.c`. Window boundaries,
+   features (relative error ≤ 1e-4), classes, actions and the boot self-test
+   must all match Python.
+
+Replay can also be run on its own for any split:
+
+```bash
+$P $S/csi_replay_parity.py --model $I/results/model.joblib --clean-dir $I/clean \
+  --export-dir $I/firmware_export --split train
+```
 
 Outputs in `firmware_export/`:
 
 | File | Purpose |
 | --- | --- |
-| `csi_model.h` | The trained forest, as C (`csi_model_predict()`) |
-| `csi_model_config.h` | Window/subcarrier/class constants matching the trained model |
-| `csi_selftest.h` | Known-input/known-output vectors for `CSI_PRESENCE_SELFTEST` |
-| `train_report.json` | Same metrics as `csi_train_eval.py`, plus the config and C-agreement check |
+| `csi_model.h` | Forest node tables plus `csi_infer()`. Include it only from `csi_presence.c`. |
+| `csi_model_config.h` | Window, hop, feature set, mask, filters, stall, class names and `CSI_CLASS_ACTION[]` |
+| `csi_selftest.h` | Feature vectors and expected outputs for `CSI_PRESENCE_SELFTEST` |
+| `presense-control.v1.schema.json` | Control-message JSON Schema, with this model's class names |
+| `export_report.json` | Metrics, action evaluation, parity results, table size and provenance (no Wi-Fi credentials) |
 
-## 6. Integrate the exported model into the firmware
+`--on-classes` and `--off-classes` change the action policy. The defaults are:
+`approaching` → ON; `leaving` and `empty` → OFF; anything else → hold.
 
-1. Copy `firmware_export/csi_model.h`, `csi_model_config.h` and
-   `csi_selftest.h` into `application/source/`, alongside the existing
-   `csi_presence.c/.h`, `csi_uart_out.c/.h` and `csi_raw_log.c/.h`.
-2. In **Project Properties > C/C++ Build > Settings > Preprocessor**, set:
-   - `CSI_PRESENCE_ENABLE=1` — feed records into the classifier
-   - `CSI_PRESENCE_SELFTEST=1` — run the self-test at boot (first build only)
-   - `CSI_LOG_RAW=0` — stop hex-dumping raw CSI once the classifier is live,
-     or it floods the console/UART
-   - Optionally `CSI_PRES_UART_BASE=USARTn` and `CSI_PRES_UART_CLK_HZ=...` to
-     also send NDJSON out a physical UART pin, not just the console
-3. Check `csi_model.h`'s generated `csi_model_predict()` signature. If it
-   differs from `const float *, size_t` (emlearn's generated signature has
-   varied by version), adjust the call in `csi_presence.c`'s `predict()`.
-4. Build and flash. At boot, with `CSI_PRESENCE_SELFTEST=1`, the console
-   should print `PRES_SELFTEST,i,OK,...` for each class — this confirms the
-   C `featurize()` and the generated model agree with Python on identical
-   inputs. It does **not** confirm I/Q decoding from a live record; verify
-   that separately by replaying a logged session's records through the board
-   and comparing its classifications to `csi_train_export.py`'s predictions
-   for the same session.
-5. Live output is one NDJSON line per classification:
-   ```json
-   {"version":1,"event":"presence","detected":true,"confidence":0.67,
-    "model_latency_ms":0,"model_latency_us":180,"rssi":-58,"seq":1042,
-    "up_ms":123456,"class":"walking","crc":41234}
-   ```
-   plus periodic `heartbeat` frames and `error` frames (`no_csi`, `model`) —
-   see `csi_uart_out.h` for the full set of `CSI_OUT_*` build options
-   (queue depth, heartbeat interval, CRC on/off, console mirroring).
+### Results on held-out sessions (same split for both models)
+
+| | Baseline (meanvar, 30 rec) | Improved (full, 60 rec) |
+| --- | --- | --- |
+| Test accuracy / balanced accuracy | 0.685 / 0.648 | 0.799 / 0.744 |
+| Validation balanced accuracy | 0.471 | 0.572 |
+| Forest table size (flash) | ~26 KB | ~53 KB |
+| Ring buffer (RAM) | 30×47×4 = 5.6 KB | 60×47×4 = 11.3 KB |
+| Test approaching sessions ending ON | 4/5 | 3/4 |
+| Test leaving sessions wrongly ending ON | 4/5 | 2/4 |
+| Test passing-by / empty / idle sessions ever ON | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Both models are **weak**. There are only 14–16 test sessions, with a single
+`empty` session and a single `idle-nearby` session, so these figures are
+noisy. The improved model is better on every held-out measure, but it needs
+6 s of data before it can decide. An approach or departure lasts only about
+76 records, so it gets just 1–2 decisions per pass.
+
+Leaving often looks like approaching, which leaves control latched ON.
+This is the main risk: a departure that is misclassified keeps the output ON
+until a later `empty` or `leaving` decision, or until a stale/fault timeout.
+Treat both exports as integration test builds, not production models. Agree
+acceptance targets first and measure them live before relying on either.
+
+## 6. Integrate the exported model into the firmware (SDK 25.12, MCUXpresso)
+
+1. Copy these files into the demo project's `source/` folder:
+   - From the repository root: `csi_raw_log.c/.h`, `csi_presence.c/.h`,
+     `csi_uart_out.c/.h`, `csi_control.c/.h`.
+   - From one `firmware_export/` directory: `csi_model.h`,
+     `csi_model_config.h`, `csi_selftest.h`.
+2. In **Project Properties > C/C++ Build > Settings > Preprocessor**, define:
+
+   | Define | Value | Meaning |
+   | --- | --- | --- |
+   | `CSI_PRESENCE_ENABLE` | `1` | Feed records to the classifier (default 0 = logger only) |
+   | `CSI_LOG_RAW` | `1` (default) | Also print raw `CSI,` hex lines for `csi_logger.py`; set `0` for a quieter console |
+   | `CSI_PRESENCE_SELFTEST` | `1` (default) | Boot self-test. A failure latches control OFF. |
+   | `CSI_VOTE_N` | `1` (default) | No smoothing; the agreed initial policy |
+   | `CSI_PRES_UART_BASE` | e.g. `USART2` | Spare FLEXCOMM used as the control UART |
+   | `CSI_PRES_UART_FLEXCOMM` | e.g. `0U` | FLEXCOMM index; the clock is read with `CLOCK_GetFlexCommClkFreq()` |
+   | `CSI_PRES_UART_CLK_HZ` | clock in Hz | Alternative to `CSI_PRES_UART_FLEXCOMM` (one of them is required) |
+   | `CSI_OUT_UART_PROTOCOL` | `CSI_OUT_PROTO_CONTROL` (default) | Control UART sends only `control` frames |
+   | `CSI_CTRL_PERIOD_MS` / `CSI_CTRL_STALE_MS` | `1000` / `5000` (defaults) | Resend period / OFF after no prediction |
+   | `CSI_MEASURE_LATENCY` | `1` (default) | DWT cycle counter; set `0` if DWT is unavailable |
+
+3. Configure that FLEXCOMM's clock and its TX pin in **MCUXpresso Config
+   Tools**; the macros alone do not set up pins. Pick a genuinely unused
+   instance and check the header pin and I/O voltage (3.3 V) in the
+   FRDM-RW612 board manual. Do not reuse the debug-console UART.
+4. Call `csi_raw_log_init()` once FreeRTOS objects can be created, and check
+   that it returns 0. Only then register `csi_raw_log_cb` with
+   `wlan_register_csi_user_callback()`. `csi_raw_log_init()` itself calls
+   `csi_presence_init()`, which calls `csi_out_init()`. The output task sends
+   OFF immediately, and control stays OFF until a valid prediction arrives.
+5. Build, then check the linker's flash/RAM report and the task stacks. Flash
+   at boot should show `PRES_SELFTEST,...,OK` lines on the console. Live CSI
+   must come from the training AP (`c2:95:da:01:6e:c9`, channel 149);
+   records from any other source are dropped by design. The channel filter
+   uses header byte 37, as recorded during data collection; confirm this
+   field on the live AP.
+6. Debug console (USB) is unchanged: v1 `presence`, `heartbeat` and `error`
+   NDJSON, plus mirrored `control` lines (`CSI_CTRL_MIRROR_CONSOLE`).
+7. If the board can enter PM3 (power-down), the control UART loses its state.
+   Restore its pins/clock and call `csi_out_uart_reinit()` in the PM3-exit
+   hook, after the debug console is restored.
+
+Avoid passing a function-like value such as
+`CSI_PRES_UART_CLK_HZ=CLOCK_GetFlexCommClkFreq(0U)` through the IDE's
+preprocessor settings: the generated makefile does not quote it. Use
+`CSI_PRES_UART_FLEXCOMM` instead.
+
+### 6a. Reference integration: `dm-motion-detection-using-wifi-csi-on-rw61x`
+
+The FRDM-RW612 Wi-Fi sensing demo has been integrated as follows (improved model):
+
+| File | Change |
+| --- | --- |
+| `source/csi_*.c/.h`, `csi_model*.h`, `csi_selftest.h` | Copied from here and `artifacts/presense/improved/firmware_export/` |
+| `.cproject` (Debug and Release), `flags.cmake` | `CSI_PRESENCE_ENABLE=1`, `CSI_LOG_RAW=1`, `CSI_PRES_UART_BASE=USART0`, `CSI_PRES_UART_FLEXCOMM=0U` |
+| `CMakeLists.txt` | Registers the `csi_*` sources (the IDE build compiles all of `source/` anyway) |
+| `board/board.c/.h` | `BOARD_InitPresenseUart()`: `IO_MUX_FC0_USART_DATA` (mikroBUS GPIO_3 = TX, GPIO_2 = RX unused), FRG0 from PLL, attached to FLEXCOMM0 |
+| `board/lpm.c` | PM3 exit re-runs `BOARD_InitPresenseUart()` and `csi_out_uart_reinit()` |
+| `source/main.c` | Calls `BOARD_InitPresenseUart()` after the debug console. Runs `csi_raw_log_init()` **before** the Wi-Fi connect loop, so OFF is sent from boot even if the AP is unreachable, and prints the free heap. Registers `csi_raw_log_cb` only if init succeeded. |
+
+Notes:
+
+- FLEXCOMM0 was unused: FC1 drives the LCD over SPI, FC2 is the touch I2C, and FC3 is the
+  debug console. No other code muxes GPIO_2/GPIO_3. **TX is mikroBUS GPIO_3** (confirmed on the board);
+  wire it to the receiver's RX, plus a common ground, at 3.3 V. GPIO_2 (FC0 RXD) is muxed but not enabled.
+- `BOARD_InitSleepPinConfig()` drives non-AON pins low in sleep, so the TX line goes low (a UART
+  break) during PM2/PM3. The receiver drops partial lines and its 3 s watchdog turns it OFF.
+- Added cost (ARM GCC 13.2, `-Os`): roughly 177 KB flash for the improved model, of which
+  113 KB is the self-test table (set `CSI_PRESENCE_SELFTEST=0` to drop it). About 21 KB of `.bss`
+  (16 x 512 B record pool plus a 60 x 47 float ring). Two 4 KB task stacks plus queues come from the
+  100 KB FreeRTOS heap. Worst static stack frame is 120 B. Check the `Free heap after CSI init` line at boot.
+- The forest sums class probabilities in `double` for exact sklearn parity. On the
+  single-precision FPU this is a few dozen soft-float adds per inference.
+- Raw logging stays on (`CSI_LOG_RAW=1`), so `csi_logger.py` can keep collecting data while the
+  classifier runs. The worker feeds the classifier first, then prints the hex line. `csi_logger.py`
+  only parses lines starting with `CSI,`, so the interleaved NDJSON and `control` lines are ignored.
+  The console uses FreeRTOS-synchronised `PRINTF` (`SDK_OS_FREE_RTOS`), so lines from different tasks
+  don't split each other. At ~10 records/s the hex is ~3.3 KB/s, well within the 115200-baud
+  console. Set `CSI_LOG_RAW=0` for a readable console. Set `CSI_PRESENCE_ENABLE=0` for the original logger only.
+- `wlan_tests.c` can still register `csi_raw_log_cb` from the CLI. The callback ignores data
+  until `csi_raw_log_init()` has succeeded.
+
+## 7. UART control output and receiver contract
+
+The control UART runs at 115200 baud, 8N1, with no flow control, and is
+one-way. Wire RW612 TX to the receiver's RX and connect a common ground.
+Use 3.3 V logic only: never connect it to RS-232 levels, or to a 5 V input
+without level shifting.
+
+Each message is one compact JSON line ending in `\n`, with a fixed key order:
+
+```json
+{"version":1,"event":"control","state":"on","reason":"prediction","class":"approaching","confidence":0.87,"seq":42,"up_ms":123456,"crc":19763}
+{"version":1,"event":"control","state":"off","reason":"startup","class":null,"confidence":null,"seq":0,"up_ms":12,"crc":64277}
+```
+
+- **`state`:** `on` or `off`. This is the policy output, not the
+  classifier's `detected` flag.
+  - `approaching` sets ON.
+  - `leaving` and `empty` set OFF.
+  - `idle-nearby` and `passing-by` keep the current state.
+- **`reason`:**
+  - `prediction`: `class` and `confidence` are filled in.
+  - `startup`: the board has just booted.
+  - `stale`: no successful prediction for `CSI_CTRL_STALE_MS`, which forces OFF.
+  - `fault`: self-test or initialization failure (latched until reboot), or
+    an invalid model output. Forces OFF.
+- **When frames are sent:** immediately on every state change, and the
+  current state is repeated every 1 s.
+- **`seq`:** a per-UART uint32 counter that wraps around.
+- **`crc`:** CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection,
+  check value `"123456789"` → `0x29B1`). It covers every byte before
+  `,"crc":`, exactly as received.
+- **Schema:** `schemas/presense-control.v1.schema.json` (draft 2020-12). Each
+  export also writes a copy with that model's class names.
+
+Receiver rules (implemented by `receiver/presense_control_rx.py`, the
+reference parser):
+
+1. Accept only complete `\n`-terminated lines of at most 256 bytes. After an
+   over-long line, discard data up to the next newline.
+2. Check the CRC, then the schema. Ignore other `event` values and unknown
+   `version` values.
+3. Act only on `state`.
+4. Start OFF at boot, and turn OFF after **3 s** without a valid frame.
+   Because the link is one-way, this watchdog is what makes a broken cable
+   or a crashed board fail safe.
+5. Track `seq`: count gaps and duplicates, and treat a jump back to a small
+   value as a sender reboot.
+
+```bash
+.venv-deploy/bin/python receiver/presense_control_rx.py --port /dev/ttyUSB0   # live, via a USB-UART adapter
+.venv-deploy/bin/python receiver/presense_control_rx.py --file capture.txt    # offline check
+```
+
+Before connecting the real receiver, check the following with a USB-UART
+adapter (and ideally a logic analyser):
+
+- baud rate and framing;
+- OFF at startup;
+- the 1 s resend;
+- ON on an approach;
+- OFF on stale data or when the AP is switched off.
+
+## Tests
+
+```bash
+.venv-deploy/bin/python -m pytest tests -q
+```
+
+- `tests/test_control.py`:
+  - C control policy and CRC vector.
+  - Golden frames and rejected frames.
+  - Receiver watchdog, `seq` wrap, resync and reboot detection.
+  - Output-task timing under a scripted FreeRTOS stub: startup OFF, 1 s
+    resend, stale at exactly the deadline, fault latch, outdated results
+    ignored.
+- `tests/test_records_mode.py`:
+  - Window/hop schedule and TSF resets.
+  - Mask fitted on training sessions only.
+  - Applying a fixed `csi_split --assignment`.
 
 ## Firmware module reference
 
 | Module | Role |
 | --- | --- |
-| `csi_raw_log.c/.h` | Registered as the Wi-Fi driver's CSI callback. Validates and copies each record into a pool, then a low-priority task prints raw hex (`CSI_LOG_RAW`) and/or feeds `csi_presence_feed()` (`CSI_PRESENCE_ENABLE`). Keeps the driver callback itself fast. |
-| `csi_presence.c/.h` | Reimplements `csi_clean.py`'s Phases 1, 3–6 and 8 in C: validate, decode I/Q → amplitude, mask non-data subcarriers, per-record normalize, drop windows spanning a TSF stall, slide a window and classify every `CSI_HOP` records, majority-vote over `CSI_VOTE_N` results. **Does not implement Phase 7 (Hampel filtering)** — train with `--hampel-window 1` to match. |
-| `csi_uart_out.c/.h` | Formats classification results, heartbeats and errors as NDJSON and sends them to the console and/or a UART pin from a dedicated low-priority task, so formatting/transmit time never blocks CSI processing. |
+| `csi_raw_log.c/.h` | Wi-Fi CSI callback. Validates each record, copies it into a pool and never blocks. A low-priority worker then prints hex (`CSI_LOG_RAW`) and/or calls `csi_presence_feed()` (`CSI_PRESENCE_ENABLE`). |
+| `csi_presence.c/.h` | Firmware version of records-mode `csi_clean.py`: validate, MAC/channel/size filter, I/Q → amplitude, mask, normalize, TSF stall/reset handling. Keeps a chronological ring buffer and computes `meanvar`/`dynamic`/`full` features (selected by `CSI_FEATURE_SET`), then calls `csi_infer()`. Also runs the boot self-test. No Hampel filter; train with `--hampel-window 1`. |
+| `csi_control.c/.h` | Pure-C ON/OFF policy, `control` JSON formatter (bounded buffer; on overflow sends an OFF fallback frame) and CRC-16. Has no RTOS dependency, so it can be tested on the host. |
+| `csi_uart_out.c/.h` | Low-priority output task driven by deadlines. Sends `control` frames on the control UART, and v1 diagnostics plus mirrored control lines on the console. Handles stale and fault rules. |
 
 ## Known gaps / things to verify before relying on this project
 
+- **Accuracy:** both models are weak and were scored on few held-out
+  sessions. No day-holdout result exists yet, and the session labels have no
+  transition timestamps, so live action latency and false-ON rate must be
+  measured on hardware.
+- **Hardware not yet verified:**
+  - The reference integration (section 6a) compiles with the ARM toolchain
+    against the project's SDK headers, but it has not been linked in the IDE or
+    run, and runtime heap, stack and inference time have not been measured.
+  - Live replay of records on the board has not been run.
+  - The receiver hardware has not been chosen.
 - **CSI fixed-point scale:** no confirmed AN14281 field for `--scale-shift`;
-  currently defaults to 0 and relies on per-record normalization.
-- **TSF unit:** assumed microseconds throughout (`csi_clean.py` and
-  `csi_presence.c`'s `CSI_STALL_US`) — confirm against AN14281.
-- **`wlan-set-csi-param-header` channel field encoding:** not confirmed.
-- **RW612 as SoftAP generating CSI:** AN14281 §7.7 suggests it's possible;
-  untested here. Start with STA mode (documented, used throughout this repo).
-- **emlearn `csi_model_predict()` signature:** varies by emlearn version —
-  check the generated header.
-- **UART pin / FLEXCOMM mapping, driver header names, DWT cycle counter
-  availability:** check the FRDM-RW612 schematic/user manual and SDK headers
-  for your exact toolchain version.
-- **Header I/O voltage:** confirm 3.3 V on the pins you wire to an external
-  host before connecting a different board.
+  it defaults to 0 and relies on per-record normalization.
+- **TSF unit:** assumed to be microseconds; confirm against AN14281.
+- **Channel field (header byte 37) encoding:** it matches the data collected
+  here (149), but has not been confirmed against AN14281.
+- **RW612 as a SoftAP generating CSI:** untested. Use STA mode.
+- **Header I/O voltage:** confirm 3.3 V on the pins you wire to another board.
 
 ## License / attribution
 

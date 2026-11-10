@@ -1,3 +1,6 @@
 data/
 clean/
 result/
+artifacts/
+.venv-deploy/
+__pycache__/
