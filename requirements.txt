@@ -35,3 +35,6 @@ traitlets==5.16.1
 typing_extensions==4.16.0
 tzdata==2026.4
 wcwidth==0.9.1
+jsonschema==4.26.0
+pyserial==3.5
+pytest==9.2.0

@@ -130,6 +130,11 @@ class TwoStage(ClassifierMixin, BaseEstimator):
         return (full + self.moving_.feature_importances_) / 2
 
 
+# model.joblib must be loadable by csi_train_export.py, which imports this file
+# as the module "csi_train_eval" rather than running it as __main__.
+TwoStage.__module__ = "csi_train_eval"
+
+
 def make_model(p, seed, n_sc, static_ids):
     if p.get("two_stage"):
         return TwoStage(n_sc=n_sc, static_classes=tuple(static_ids), model=p["model"],
@@ -297,7 +302,8 @@ def main():
     log.info("features '%s': %d per window = %s x %d subcarriers (built in %.2f s)",
              a.features, X_tr.shape[1], blocks, tr_w.shape[2], time.perf_counter() - t0)
     if a.features != "meanvar":
-        log.info("note: csi_train_export.py / csi_presence.c only implement 'meanvar' features")
+        log.info("note: csi_train_export.py exports this only for --window-mode records "
+                 "clean dirs (csi_presence.c implements meanvar/dynamic/full)")
 
     params = {"model": a.model, "trees": a.trees, "depth": a.depth or None,
               "leaf": a.min_samples_leaf, "two_stage": a.two_stage}
@@ -374,9 +380,15 @@ def main():
     (out / "train_report.json").write_text(json.dumps(report, indent=2))
     if a.save_model:
         import joblib
+        import sys
+        sys.modules.setdefault("csi_train_eval", sys.modules[__name__])
+        pre_path = clean / "preprocess_config.json"
         joblib.dump({"model": clf, "classes": classes, "features": a.features,
                      "two_stage": a.two_stage, "static_classes": static_names,
-                     "window_len": int(tr_w.shape[1])}, out / "model.joblib")
+                     "window_len": int(tr_w.shape[1]), "n_sc": int(n_sc),
+                     "params": {**params, "seed": a.seed}, "fit_on": a.fit_on,
+                     "preprocess": json.loads(pre_path.read_text()) if pre_path.exists() else None},
+                    out / "model.joblib")
         log.info("saved model to %s", out / "model.joblib")
     log.info("done. report: %s, log: %s", out / "train_report.json", out / "train_eval.log")
 

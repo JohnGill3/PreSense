@@ -23,6 +23,11 @@ make sure --cmd-delay is long enough for your AP/board to associate, or
 split connect and CSI-enable commands into two separate script runs if
 association time varies a lot.
 
+For optional Linux ping traffic and measured CSI-rate diagnostics, see
+HIGH_RATE_CAPTURE.md. --ping-target must be the RW612 Wi-Fi IPv4 address;
+data-frame CSI capture and sufficient serial bandwidth must be configured
+separately. Requested traffic rate is not guaranteed CSI sampling rate.
+
 Output (in --out): <label>_<timestamp>.csv  one row per valid record, with the
                    complete raw record as hex (lossless; decode I/Q later)
                    <label>_<timestamp>.json session metadata and counters
@@ -30,10 +35,12 @@ Output (in --out): <label>_<timestamp>.csv  one row per valid record, with the
 import argparse
 import csv
 import json
+import math
 import time
 from pathlib import Path
 
 import serial
+from capture_rate import CaptureRate, PingTraffic, positive_rate
 
 HDR, TAIL = 48, 4
 FIELDS = ["host_time", "seq", "tick_ms", "tsf", "src", "channel", "rssi_a",
@@ -103,6 +110,11 @@ def main():
     ap.add_argument("--src-mac", default=None, help="keep only records from this MAC")
     ap.add_argument("--out", default="data")
     ap.add_argument("--notes", default="")
+    ap.add_argument("--ping-target", help="Linux only: RW612 Wi-Fi IPv4 address to ping during capture")
+    ap.add_argument("--ping-rate", type=positive_rate, default=100,
+                    help="requested ping packets/s (default 100); not a guaranteed CSI rate")
+    ap.add_argument("--target-csi-rate", type=positive_rate, default=100,
+                    help="warn when captured CSI records/s is below this target (default 100)")
     ap.add_argument("--cmd", action="append", default=[], help="sent before recording")
     ap.add_argument("--stop-cmd", action="append", default=[], help="sent after recording")
     ap.add_argument("--cmd-delay", type=float, default=2.0, help="seconds after each command")
@@ -116,6 +128,12 @@ def main():
                          "banner, command echo, connect-wait scan). Lines containing "
                          "'error'/'fail', and a connect timeout, still print.")
     a = ap.parse_args()
+    try:
+        traffic = PingTraffic(a.ping_target, a.ping_rate)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if a.duration <= 0 or not math.isfinite(a.duration):
+        ap.error("--duration must be finite and positive")
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -148,9 +166,17 @@ def main():
         time.sleep(a.start_delay)
     ser.reset_input_buffer()
 
+    try:
+        traffic.start()
+    except (OSError, RuntimeError) as exc:
+        ser.close()
+        ap.exit(1, f"Traffic startup failed: {exc}\n")
     good = bad = skipped = seq_gaps = 0
     fw_msgs, last_seq = [], None
+    capture = CaptureRate()
+    traffic_error = None
     t0 = time.time()
+    started = time.monotonic()
     next_report = t0 + 5
     print(f"Recording '{a.label}' for {a.duration:.0f} s (Ctrl-C to stop early)")
 
@@ -158,8 +184,10 @@ def main():
         with open(f"{base}.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(FIELDS)
-            while time.time() - t0 < a.duration:
-                line = ser.readline().decode(errors="ignore").strip()
+            while time.monotonic() - started < a.duration:
+                traffic.check()
+                wire = ser.readline()
+                line = wire.decode(errors="ignore").strip()
                 if line.startswith("CSI,"):
                     p = line.split(",", 4)
                     try:
@@ -170,12 +198,13 @@ def main():
                     if rec is None:
                         bad += 1
                         continue
-                    if want_mac and rec["src"] != want_mac:
-                        skipped += 1
-                        continue
                     if last_seq is not None and seq != last_seq + 1:
                         seq_gaps += 1
                     last_seq = seq
+                    if want_mac and rec["src"] != want_mac:
+                        skipped += 1
+                        continue
+                    capture.add(rec["tsf"], len(wire))
                     w.writerow([f"{time.time():.6f}", seq, tick, rec["tsf"], rec["src"],
                                 rec["channel"], rec["rssi_a"], rec["nf_a"], rec["sinr"],
                                 rec["ap_type"], rec["data_bytes"], p[4]])
@@ -189,11 +218,22 @@ def main():
                           f"{bad} bad, {len(fw_msgs)} firmware warnings")
     except KeyboardInterrupt:
         print("Stopped early.")
+    except RuntimeError as exc:
+        traffic_error = str(exc)
+        print(f"Traffic failed: {exc}")
+    finally:
+        t1 = time.time()
+        elapsed = time.monotonic() - started
+        traffic.stop()
 
-    t1 = time.time()
-    for c in a.stop_cmd:
-        send(ser, c, a.cmd_delay, quiet=a.quiet)
-    ser.close()
+    try:
+        for c in a.stop_cmd:
+            send(ser, c, a.cmd_delay, quiet=a.quiet)
+    finally:
+        ser.close()
+    rate_summary = capture.summary(elapsed, a.baud, a.target_csi_rate)
+    for warning in rate_summary["warnings"]:
+        print(f"WARNING: {warning}")
 
     meta = {
         "label": a.label, "notes": a.notes, "port": a.port, "baud": a.baud,
@@ -202,9 +242,16 @@ def main():
         "bad_lines": bad, "other_mac_skipped": skipped, "seq_gaps": seq_gaps,
         "firmware_warnings": fw_msgs[-20:], "src_mac_filter": want_mac,
         "commands": a.cmd,
+        "capture_quality": rate_summary,
+        "traffic": {"mode": "ping" if a.ping_target else "external_or_beacon",
+                    "target_ipv4": a.ping_target,
+                    "requested_ping_rate_hz": a.ping_rate if a.ping_target else None,
+                    "error": traffic_error},
     }
     Path(f"{base}.json").write_text(json.dumps(meta, indent=2))
     print(f"Saved {base}.csv ({good} records) and {base}.json")
+    if traffic_error:
+        ap.exit(1, "Capture ended because traffic generation failed; partial data was saved.\n")
 
 
 if __name__ == "__main__":
