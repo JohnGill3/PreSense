@@ -1,9 +1,10 @@
 /*
- * csi_raw_log.c - log complete raw CSI records over the debug console.
+ * csi_raw_log.c - CSI driver callback -> pool -> worker task (see csi_raw_log.h).
  *
  * The Wi-Fi driver callback only validates and copies each record into a
- * static pool. A low-priority task prints it, so the driver is never blocked
- * by UART output.
+ * static pool. A low-priority task prints it (CSI_LOG_RAW) and/or feeds the
+ * classifier (CSI_PRESENCE_ENABLE), so the driver is never blocked by UART
+ * output or inference.
  *
  * Output, one line per record (parse this on the PC):
  *     CSI,<seq>,<tick_ms>,<record_bytes>,<hex of the whole record>
@@ -33,8 +34,11 @@
 #include "queue.h"
 #include "task.h"
 #include "fsl_debug_console.h"
+#if CSI_PRESENCE_ENABLE
+#include "csi_presence.h"
+#endif
 
-#define CSI_SIGNATURE   0xABCDU
+#define CSI_LOG_SIGNATURE   0xABCDU
 #define CSI_HDR_BYTES   48U
 #define CSI_TAIL_BYTES  4U
 #define CSI_MIN_RECORD  (CSI_HDR_BYTES + CSI_TAIL_BYTES)
@@ -48,7 +52,9 @@ typedef struct
 static csi_item_t s_pool[CSI_LOG_QUEUE_DEPTH];
 static QueueHandle_t s_free; /* indices of unused pool entries */
 static QueueHandle_t s_full; /* indices waiting to be printed  */
+#if CSI_LOG_RAW
 static char s_line[64U + 2U * CSI_LOG_MAX_RECORD_BYTES];
+#endif
 
 static volatile uint32_t s_dropped;
 static volatile uint32_t s_bad;
@@ -60,7 +66,7 @@ static uint16_t rd16(const uint8_t *p)
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-#if CSI_LOG_PRINT_SUMMARY
+#if CSI_LOG_RAW && CSI_LOG_PRINT_SUMMARY
 static uint32_t rd32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -88,7 +94,7 @@ int csi_raw_log_cb(void *buffer, size_t len)
         size_t rec = (size_t)rd16(p) * 4U; /* length field is in dwords */
         uint8_t idx;
 
-        if ((rd16(p + 2) != CSI_SIGNATURE) || (rec < CSI_MIN_RECORD) || (rec > left))
+        if ((rd16(p + 2) != CSI_LOG_SIGNATURE) || (rec < CSI_MIN_RECORD) || (rec > left))
         {
             s_bad_len = (uint32_t)len;
             s_bad_rec = (uint32_t)rec;
@@ -122,6 +128,7 @@ int csi_raw_log_cb(void *buffer, size_t len)
     return 0;
 }
 
+#if CSI_LOG_RAW
 #if CSI_LOG_PRINT_SUMMARY
 static void print_summary(uint32_t seq, const csi_item_t *it)
 {
@@ -157,6 +164,7 @@ static void print_record(uint32_t seq, const csi_item_t *it)
     print_summary(seq, it);
 #endif
 }
+#endif /* CSI_LOG_RAW */
 
 static void csi_log_task(void *arg)
 {
@@ -170,7 +178,13 @@ static void csi_log_task(void *arg)
         {
             continue;
         }
-        print_record(seq++, &s_pool[idx]);
+#if CSI_PRESENCE_ENABLE
+        csi_presence_feed(s_pool[idx].data, s_pool[idx].len);
+#endif
+#if CSI_LOG_RAW
+        print_record(seq, &s_pool[idx]);
+#endif
+        seq++;
         (void)xQueueSend(s_free, &idx, 0);
 
         if (s_dropped != last_drop)
@@ -194,11 +208,21 @@ int csi_raw_log_init(void)
         return 0; /* already initialised */
     }
 
+#if CSI_PRESENCE_ENABLE
+    /* classifier + output task first, so the first record has somewhere to go;
+     * on failure the output task (if it started) keeps control latched OFF */
+    if (csi_presence_init() != 0)
+    {
+        PRINTF("CSI_PRESENCE_INIT_FAILED\r\n");
+        return -1;
+    }
+#endif
+
     s_free = xQueueCreate(CSI_LOG_QUEUE_DEPTH, sizeof(uint8_t));
     s_full = xQueueCreate(CSI_LOG_QUEUE_DEPTH, sizeof(uint8_t));
     if ((s_free == NULL) || (s_full == NULL))
     {
-        return -1;
+        goto fail;
     }
 
     for (uint8_t i = 0U; i < CSI_LOG_QUEUE_DEPTH; i++)
@@ -208,7 +232,21 @@ int csi_raw_log_init(void)
 
     if (xTaskCreate(csi_log_task, "csi_log", 1024U, NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS)
     {
-        return -1;
+        goto fail;
     }
     return 0;
+
+fail:
+    /* leave s_free NULL so csi_raw_log_cb() ignores CSI if it is registered anyway */
+    if (s_free != NULL)
+    {
+        vQueueDelete(s_free);
+        s_free = NULL;
+    }
+    if (s_full != NULL)
+    {
+        vQueueDelete(s_full);
+        s_full = NULL;
+    }
+    return -1;
 }
